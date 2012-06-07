@@ -1,0 +1,137 @@
+#!/usr/bin/perl
+#  Copyright 2012 TripAdvisor, LLC
+#
+#  Licensed under the Apache License, Version 2.0 (the "License");
+#  you may not use this file except in compliance with the License.
+#  You may obtain a copy of the License at
+#
+#       http://www.apache.org/licenses/LICENSE-2.0
+#
+#  Unless required by applicable law or agreed to in writing, software
+#  distributed under the License is distributed on an "AS IS" BASIS,
+#  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+#  See the License for the specific language governing permissions and
+#  limitations under the License.
+#
+# Check hadoop web report for network details
+#
+# Options:
+# --hadoop_root <dir> : MANDATORY, specify root of all hadoop files
+#
+###############################################################################
+
+use strict;
+use warnings;
+
+use FindBin qw($Bin);
+use lib $Bin;
+
+use Getopt::Long;
+use LWP::Simple;
+use XML::Simple;
+
+# nagios variables
+
+my $CRITICAL = 2;
+my $WARNING = 1;
+my $OK = 0;
+
+my $test = 'HADOOP_NETWORK';
+
+sub critical { print "$test CRITICAL: @_\n"; exit $CRITICAL }
+sub warning { print "$test WARNING: @_\n"; exit $WARNING }
+sub ok { print "$test OK: @_\n"; exit $OK }
+
+###############################################################################
+# Options
+
+my $hadoop_root;
+
+GetOptions(
+    "hadoop_root=s" => \$hadoop_root,
+) or main::critical("Cannot parse options, $!");
+
+$hadoop_root or main::critical("Must specify hadoop root with --hadoop_root");
+
+###############################################################################
+# Main program
+
+#######################################
+# Get the url for the machines.jsp page from conf/mapred-site.xml
+my $xmlConfig = $hadoop_roota."/conf/mapred-site.xml";
+my $config = XMLin($xmlConfig);
+
+if (!$config->{property}{'mapred.job.tracker'}) {
+  critical("Cannot find property mapred.job.tracker in $xmlConfig");
+}
+if (!$config->{property}{'mapred.job.tracker.http.address'}) {
+  critical("Cannot find property mapred.job.tracker.http.address in $xmlConfig");
+}
+if (!$config->{property}{'mapred.tasktracker.map.tasks.maximum'}) {
+  critical("Cannot find property mapred.tasktracker.map.tasks.maximum in $xmlConfig");
+}
+if (!$config->{property}{'mapred.tasktracker.reduce.tasks.maximum'}) {
+  critical("Cannot find property mapred.tasktracker.reduce.tasks.maximum in $xmlConfig");
+}
+
+# build the url -- use the hostname from mapred.job.tracker and the
+# :port from mapred.job.tracker.http.address
+my $uhost = $config->{property}{'mapred.job.tracker'}{value};
+$uhost =~ s/:\d+$//;
+my $uport = $config->{property}{'mapred.job.tracker.http.address'}{value};
+$uport =~ s/^[^:]+:/:/;
+
+my $url = "http://".$uhost.$uport."/machines.jsp?type=active";
+
+########################################
+# get my hostname
+my $myHostname = `hostname`;
+chop($myHostname);
+
+#######################################
+# Load in the web page with the max_map_tasks and max_reduce_tasks details
+my $html = get($url);
+$html =~ s/\n//g;
+
+#######################################
+# The data is in a basic table with easy-to-parse rows, so extract the info using a r.e.
+my @problems;
+my $nodeCount;
+while ($html =~ m%<tr><td>(.*?)</td><td>(.*?)</td><td>(.*?)</td><td>(.*?)</td><td>(.*?)</td><td>(.*?)</td><td>(.*?)</td></tr>%g) {
+  my ($name,$host,$running_tasks,$max_map_tasks,$max_reduce_tasks,$failures,$seconds_since_heartbeat) = ($1,$2,$3,$4,$5,$6,$7);
+  next if $name =~ /Name/;
+  next if $name !~ /$myHostname/;
+
+  $nodeCount++;
+
+  if ($max_reduce_tasks == 0 || $max_map_tasks == 0) {
+      push @problems, "Host $host: max_reduce_tasks=$max_reduce_tasks, max_map_tasks=$max_map_tasks";
+  }
+
+  # Compare values with local config
+  my $val;
+
+  $val = $config->{property}{'mapred.tasktracker.map.tasks.maximum'}{value};
+  if ($val != $max_map_tasks)
+  {
+      push(@problems, "Running max-map-tasks setting of $max_map_tasks doesn't match config value of $val");
+  }
+
+  $val = $config->{property}{'mapred.tasktracker.reduce.tasks.maximum'}{value};
+  if ($val != $max_reduce_tasks)
+  {
+      push(@problems, "Running max-reduce-tasks setting of $max_reduce_tasks doesn't match config value of $val");
+  }
+}
+
+#######################################
+# make sure we found an entry for this host
+critical("Cannot find node $myHostname in the machine list") if ($nodeCount==0);
+critical("$myHostname appears $nodeCount times the machine list") if ($nodeCount>1);
+
+#######################################
+# If we found problems, this is a problem!
+critical(join(';',@problems)) if @problems;
+
+#######################################
+ok("Node has max_map_tasks & max_reduce_tasks > 0");
